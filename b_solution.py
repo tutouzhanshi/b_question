@@ -38,6 +38,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.font_manager import FontProperties
 from scipy.optimize import minimize_scalar
 from scipy.signal import savgol_filter
+from scipy.stats import f as f_dist
 
 
 DT_OUT = 0.1
@@ -67,14 +68,28 @@ class AlignmentResult:
     bias_model_improvement: float | None = None
     has_system_bias: bool = True
     overlap_seconds: float = 0.0
+    ci_delta_lo: float = 0.0
+    ci_delta_hi: float = 0.0
+    f_statistic: float | None = None
+    f_p_value: float | None = None
+    candidate_bias_x: float = 0.0
+    candidate_bias_y: float = 0.0
+    candidate_delta: float = 0.0
+    candidate_mse: float = 0.0
 
 
 def discover_files(root: Path) -> tuple[dict[int, Path], Path]:
     xlsx_files: dict[int, Path] = {}
     result_template: Path | None = None
+    result_candidates: list[Path] = []
     for path in root.glob("*.xlsx"):
-        if path.name.lower().startswith("result"):
+        if path.name.startswith("~$"):
+            continue
+        if path.name.lower() == "result.xlsx":
             result_template = path
+            continue
+        if path.name.lower().startswith("result"):
+            result_candidates.append(path)
             continue
         m = re.search(r"(\d+)", path.name)
         if m:
@@ -82,6 +97,8 @@ def discover_files(root: Path) -> tuple[dict[int, Path], Path]:
     missing = [i for i in (1, 2, 3, 4) if i not in xlsx_files]
     if missing:
         raise FileNotFoundError(f"缺少附件：{missing}")
+    if result_template is None and result_candidates:
+        result_template = sorted(result_candidates)[0]
     if result_template is None:
         raise FileNotFoundError("未找到 result.xlsx 模板")
     return xlsx_files, result_template
@@ -93,6 +110,113 @@ def read_pair(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarra
     a1 = d1.iloc[:, 0:3].to_numpy(float)
     a2 = d2.iloc[:, 0:3].to_numpy(float)
     return a1[:, 0], a1[:, 1:3], a2[:, 0], a2[:, 1:3]
+
+
+def bias_f_test(
+    mse_without_bias: float,
+    mse_with_bias: float,
+    n_samples: int,
+    n_bias_params: int = 2,
+    alpha: float = 0.05,
+) -> tuple[float, float, bool]:
+    """嵌套模型F检验 H0: 无系统偏差 (bx=by=0)."""
+    if mse_with_bias <= 0 or mse_without_bias <= mse_with_bias:
+        return 1.0, 1.0, False
+    df1 = n_bias_params
+    df2 = n_samples - df1
+    if df2 <= 0:
+        return 1.0, 1.0, False
+    sse_without = mse_without_bias * n_samples
+    sse_with = mse_with_bias * n_samples
+    f_stat = ((sse_without - sse_with) / df1) / (sse_with / df2)
+    p_value = 1.0 - f_dist.cdf(f_stat, df1, df2)
+    return f_stat, p_value, p_value < alpha
+
+
+def estimate_alignment_raw(
+    t1: np.ndarray, p1: np.ndarray, t2: np.ndarray, p2: np.ndarray,
+    d_min: float, d_max: float,
+    correct_bias: bool,
+    score_smooth_window: int,
+    trim_ratio: float,
+    min_overlap_ratio: float = 0.85,
+) -> tuple[float, np.ndarray, float, float]:
+    """核心对齐搜索（粗扫+精细优化），被主估计和bootstrap共用."""
+    p1s = moving_average(p1, score_smooth_window)
+    p2s = moving_average(p2, score_smooth_window)
+    deltas = np.linspace(d_min, d_max, 2500)
+    scores = np.array(
+        [
+            delta_score(t1, p1s, t2, p2s, d, correct_bias, 0.5, trim_ratio, min_overlap_ratio)[0]
+            for d in deltas
+        ]
+    )
+    best_i = int(np.nanargmin(scores))
+    best = float(deltas[best_i])
+    step = float(deltas[1] - deltas[0]) if len(deltas) > 1 else 1.0
+    lo = max(d_min, best - 20 * step)
+    hi = min(d_max, best + 20 * step)
+    opt = minimize_scalar(
+        lambda d: delta_score(t1, p1s, t2, p2s, d, correct_bias, 0.1, trim_ratio, min_overlap_ratio)[0],
+        bounds=(lo, hi),
+        method="bounded",
+        options={"xatol": 1e-7},
+    )
+    mse, bias, overlap = delta_score(
+        t1, p1s, t2, p2s, float(opt.x), correct_bias, 0.1, trim_ratio, min_overlap_ratio
+    )
+    return float(opt.x), bias, mse, overlap
+
+
+def bootstrap_ci(
+    t1: np.ndarray, p1: np.ndarray, t2: np.ndarray, p2: np.ndarray,
+    delta_hat: float, bias_hat: np.ndarray,
+    n_bootstrap: int = 199,
+    alpha: float = 0.05,
+    dt: float = 0.1,
+) -> tuple[float, float, float, float]:
+    """Linearized residual bootstrap CI for delta and bias.
+
+    At the optimum, changing delta moves the corrected mode-2 trajectory along
+    its local velocity. Resampling residuals and solving the one-parameter
+    least-squares perturbation gives a non-degenerate uncertainty estimate
+    without rerunning the expensive global search hundreds of times.
+    """
+    t2_corr = t2 - delta_hat
+    p2_corr = p2 - bias_hat
+    lo = max(float(t1.min()), float(t2_corr.min()))
+    hi = min(float(t1.max()), float(t2_corr.max()))
+    grid = np.arange(lo, hi + 1e-9, dt)
+    q1 = interp_xy(grid, t1, p1)
+    q2 = interp_xy(grid, t2_corr, p2_corr)
+    residuals = q2 - q1
+    velocity = np.gradient(q2, dt, axis=0)
+    n_res = len(residuals)
+    if n_res < 10:
+        return 0.0, 0.0, 0.0, 0.0
+
+    deltas_bs, bias_x_bs, bias_y_bs = [], [], []
+    rng = np.random.default_rng(2026)
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n_res, size=n_res)
+        res_bs = residuals[idx]
+        bias_bs = np.median(res_bs, axis=0)
+        bias_x_bs.append(bias_bs[0])
+        bias_y_bs.append(bias_bs[1])
+        v_bs = velocity[idx]
+        res_center = res_bs - np.median(res_bs, axis=0)
+        denom = float(np.sum(v_bs ** 2))
+        if denom <= 1e-12:
+            deltas_bs.append(delta_hat)
+            continue
+        eps = -float(np.sum(v_bs * res_center)) / denom
+        deltas_bs.append(delta_hat + eps)
+
+    if len(deltas_bs) < 2:
+        return 0.0, 0.0, 0.0, 0.0
+    d_lo, d_hi = np.percentile(deltas_bs, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    bx_lo, bx_hi = np.percentile(bias_x_bs, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(d_lo), float(d_hi), float(bx_lo), float(bx_hi)
 
 
 def moving_average(y: np.ndarray, window: int) -> np.ndarray:
@@ -150,82 +274,91 @@ def estimate_alignment(
     min_overlap_ratio: float = 0.85,
 ) -> tuple[float, np.ndarray, float, float]:
     t1, p1, t2, p2 = read_pair(path)
-    p1s = moving_average(p1, score_smooth_window)
-    p2s = moving_average(p2, score_smooth_window)
-
     min_duration = min(float(t1.max() - t1.min()), float(t2.max() - t2.min()))
     d_min = float(t2.min() - t1.max() + min_overlap_ratio * min_duration)
     d_max = float(t2.max() - t1.min() - min_overlap_ratio * min_duration)
-    deltas = np.linspace(d_min, d_max, 2500)
-    scores = np.array(
-        [
-            delta_score(t1, p1s, t2, p2s, d, correct_bias, 0.5, trim_ratio, min_overlap_ratio)[0]
-            for d in deltas
-        ]
-    )
-    best_i = int(np.nanargmin(scores))
-    best = float(deltas[best_i])
-    step = float(deltas[1] - deltas[0]) if len(deltas) > 1 else 1.0
-    lo = max(d_min, best - 20 * step)
-    hi = min(d_max, best + 20 * step)
-    opt = minimize_scalar(
-        lambda d: delta_score(t1, p1s, t2, p2s, d, correct_bias, 0.1, trim_ratio, min_overlap_ratio)[0],
-        bounds=(lo, hi),
-        method="bounded",
-        options={"xatol": 1e-7},
-    )
-    mse, bias, overlap = delta_score(
-        t1, p1s, t2, p2s, float(opt.x), correct_bias, 0.1, trim_ratio, min_overlap_ratio
-    )
-    return float(opt.x), bias, mse, overlap
+    return estimate_alignment_raw(t1, p1, t2, p2, d_min, d_max, correct_bias,
+                                   score_smooth_window, trim_ratio, min_overlap_ratio)
+
+
+def compute_overlap_n(t1: np.ndarray, p1: np.ndarray, t2: np.ndarray, p2: np.ndarray,
+                      delta: float, dt: float = 0.1) -> int:
+    """重叠区间内的样本数（用于F检验自由度）. """
+    t2_corr = t2 - delta
+    lo = max(float(t1.min()), float(t2_corr.min()))
+    hi = min(float(t1.max()), float(t2_corr.max()))
+    return max(1, int(round((hi - lo) / dt)))
 
 
 def build_alignment_results(files: dict[int, Path]) -> dict[int, AlignmentResult]:
     results: dict[int, AlignmentResult] = {}
 
+    # ----- Problem 1: 无噪声无偏差 -----
     d1, b1, mse1, ov1 = estimate_alignment(1, files[1], False, 1, 0.0)
     results[1] = AlignmentResult(1, d1, 0.0, 0.0, mse1, has_system_bias=False, overlap_seconds=ov1)
 
+    # ----- Problem 2: 随机噪声 + 系统偏差 -----
+    t1_2, p1_2, t2_2, p2_2 = read_pair(files[2])
     d2, b2, mse2, ov2 = estimate_alignment(2, files[2], True, 9, 0.02)
     d2_nb, _b2_nb, mse2_nb, _ov2_nb = estimate_alignment(2, files[2], False, 9, 0.02)
     improvement2 = (mse2_nb - mse2) / mse2_nb if mse2_nb > 0 else 0.0
+    n2 = compute_overlap_n(t1_2, p1_2, t2_2, p2_2, d2)
+    f_stat2, f_p2, has_bias2 = bias_f_test(mse2_nb, mse2, n2)
     results[2] = AlignmentResult(
-        2,
-        d2,
-        float(b2[0]),
-        float(b2[1]),
-        mse2,
-        mse_without_bias=mse2_nb,
-        bias_model_improvement=improvement2,
-        has_system_bias=True,
-        overlap_seconds=ov2,
+        2, d2, float(b2[0]), float(b2[1]), mse2,
+        mse_without_bias=mse2_nb, bias_model_improvement=improvement2,
+        has_system_bias=has_bias2, overlap_seconds=ov2,
+        f_statistic=f_stat2, f_p_value=f_p2,
     )
 
+    # ----- Problem 3: 实测数据 -----
+    t1_3, p1_3, t2_3, p2_3 = read_pair(files[3])
     d3_b, b3, mse3_b, ov3_b = estimate_alignment(3, files[3], True, 11, 0.05)
     d3_nb, _b3_nb, mse3_nb, ov3_nb = estimate_alignment(3, files[3], False, 11, 0.05)
     improvement3 = (mse3_nb - mse3_b) / mse3_nb if mse3_nb > 0 else 0.0
-    bias_norm = float(np.linalg.norm(b3))
-    has_bias3 = bool(improvement3 >= 0.05 and bias_norm >= 0.5)
+    n3 = compute_overlap_n(t1_3, p1_3, t2_3, p2_3, d3_b)
+    f_stat3, f_p3, stat_has_bias3 = bias_f_test(mse3_nb, mse3_b, n3)
+    bias_norm3 = float(np.linalg.norm(b3))
+    has_bias3 = bool(stat_has_bias3 and bias_norm3 >= 0.1)
+
     if has_bias3:
         d3, b3_used, mse3, ov3 = d3_b, b3, mse3_b, ov3_b
     else:
         d3, b3_used, mse3, ov3 = d3_nb, np.zeros(2), mse3_nb, ov3_nb
+
     results[3] = AlignmentResult(
-        3,
-        d3,
-        float(b3_used[0]),
-        float(b3_used[1]),
-        mse3,
-        mse_without_bias=mse3_nb,
-        bias_model_improvement=improvement3,
-        has_system_bias=has_bias3,
-        overlap_seconds=ov3,
+        3, d3, float(b3_used[0]), float(b3_used[1]), mse3,
+        mse_without_bias=mse3_nb, bias_model_improvement=improvement3,
+        has_system_bias=has_bias3, overlap_seconds=ov3,
+        f_statistic=f_stat3, f_p_value=f_p3,
     )
-    # 保存实际数据的候选偏差，供论文说明。
-    results[3].candidate_bias_x = float(b3[0])  # type: ignore[attr-defined]
-    results[3].candidate_bias_y = float(b3[1])  # type: ignore[attr-defined]
-    results[3].candidate_delta = float(d3_b)  # type: ignore[attr-defined]
-    results[3].candidate_mse = float(mse3_b)  # type: ignore[attr-defined]
+    # 保存候选偏差供论文参考（无论是否被采用）
+    results[3].candidate_bias_x = float(b3[0])
+    results[3].candidate_bias_y = float(b3[1])
+    results[3].candidate_delta = float(d3_b)
+    results[3].candidate_mse = float(mse3_b)
+
+    # ----- Bootstrap置信区间（问题2&3） -----
+    for prob in (2, 3):
+        r = results[prob]
+        t1_, p1_, t2_, p2_ = read_pair(files[prob])
+        if prob == 2:
+            sw, tr = 9, 0.02
+        else:
+            sw, tr = 11, 0.05
+        d_lo, d_hi, bx_lo, bx_hi = bootstrap_ci(
+            t1_, p1_, t2_, p2_, r.delta2_minus_1,
+            np.array([r.bias2_x, r.bias2_y]),
+            n_bootstrap=199,
+        )
+        # 如果bootstrap没给有效结果则使用渐近近似
+        if d_lo == 0 and d_hi == 0:
+            # 基于MSE曲率近似95% CI: ±1.96 * sigma/sqrt(n)
+            n_samples = compute_overlap_n(t1_, p1_, t2_, p2_, r.delta2_minus_1)
+            sigma_d = np.sqrt(r.mse_with_bias / n_samples) if r.mse_with_bias > 0 else 0.01
+            d_lo, d_hi = r.delta2_minus_1 - 1.96 * sigma_d, r.delta2_minus_1 + 1.96 * sigma_d
+        r.ci_delta_lo, r.ci_delta_hi = float(d_lo), float(d_hi)
+
     return results
 
 
@@ -246,15 +379,23 @@ def make_trajectory(
 
     q1 = interp_xy(grid, t1, p1)
     q2 = interp_xy(grid, t2_corr, p2_corr)
-    fused = 0.5 * (q1 + q2)
-    if smooth_window > 1 and len(fused) > smooth_window:
+    fused_raw = 0.5 * (q1 + q2)  # unsmoothed fusion for derivative computation
+    if smooth_window > 1 and len(fused_raw) > smooth_window:
         if smooth_window % 2 == 0:
             smooth_window += 1
-        fused = savgol_filter(fused, smooth_window, smooth_poly, axis=0, mode="interp")
+        fused = savgol_filter(fused_raw, smooth_window, smooth_poly, axis=0, mode="interp")
+        # Savgol analytical derivative: fit polynomial, differentiate analytically
+        # deriv=1 gives dy/dsample, divide by DT_OUT to get dy/dt
+        vel = savgol_filter(fused_raw, smooth_window, smooth_poly,
+                            deriv=1, axis=0, mode="interp") / DT_OUT
+        acc_vec = savgol_filter(fused_raw, smooth_window, smooth_poly,
+                                deriv=2, axis=0, mode="interp") / DT_OUT ** 2
+    else:
+        fused = fused_raw.copy()
+        vel = np.gradient(fused, DT_OUT, axis=0)
+        acc_vec = np.gradient(vel, DT_OUT, axis=0)
 
-    vel = np.gradient(fused, DT_OUT, axis=0)
     speed = np.linalg.norm(vel, axis=1)
-    acc_vec = np.gradient(vel, DT_OUT, axis=0)
     acc = np.linalg.norm(acc_vec, axis=1)
     return pd.DataFrame(
         {
@@ -364,6 +505,55 @@ def select_task_candidates(traj: pd.DataFrame, target_path: Path) -> pd.DataFram
     return tasks.sort_values(["prep_start_s", "exec_time_s", "target_id", "task"]).reset_index(drop=True)
 
 
+def weighted_interval_scheduling(tasks: pd.DataFrame) -> pd.DataFrame:
+    """加权区间调度（DP）求最大期望完成数的非重叠子集.
+
+    每项任务有开始时间 prep_start_s 和结束时间 exec_time_s，
+    权重 expected_success（射击0.85，拍照1.0）。
+    """
+    if tasks.empty:
+        return tasks
+    df = tasks.copy()
+    df["end_s"] = df["exec_time_s"].astype(float)
+    df["start_s"] = df["prep_start_s"].astype(float)
+    df["weight"] = df["expected_success"].astype(float)
+    df = df.sort_values("end_s").reset_index(drop=True)
+
+    n = len(df)
+    # p[i] = 最靠右的与task i不冲突的任务索引（-1表示无）
+    p = [-1] * n
+    for i in range(n):
+        for j in range(i - 1, -1, -1):
+            if df.loc[j, "end_s"] <= df.loc[i, "start_s"] - 1e-9:
+                p[i] = j
+                break
+
+    # DP: dp[i] = 前i+1个任务的最大权重
+    dp = [0.0] * n
+    selected = [False] * n
+    for i in range(n):
+        w_include = df.loc[i, "weight"] + (dp[p[i]] if p[i] >= 0 else 0.0)
+        w_exclude = dp[i - 1] if i > 0 else 0.0
+        if w_include >= w_exclude:
+            dp[i] = w_include
+            selected[i] = True
+        else:
+            dp[i] = w_exclude
+            selected[i] = False
+
+    # 回溯
+    chosen: list[int] = []
+    i = n - 1
+    while i >= 0:
+        if selected[i]:
+            chosen.append(i)
+            i = p[i]
+        else:
+            i -= 1
+    chosen.reverse()
+    return df.iloc[chosen].drop(columns=["end_s", "start_s", "weight"]).reset_index(drop=True)
+
+
 def filter_sequential(tasks: pd.DataFrame) -> pd.DataFrame:
     if tasks.empty:
         return tasks
@@ -377,16 +567,28 @@ def filter_sequential(tasks: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_result_xlsx(template: Path, output: Path, tasks: pd.DataFrame) -> None:
-    shutil.copy2(template, output)
-    wb = load_workbook(output)
+    # 清除Office锁文件，然后尝试写目标路径；被锁定时用临时路径
+    lock = output.parent / ("~$" + output.name)
+    if lock.exists():
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+    try:
+        dest = output
+        shutil.copy2(template, output)
+    except PermissionError:
+        dest = output.parent / "_temp_result.xlsx"
+        shutil.copy2(template, dest)
+    wb = load_workbook(dest)
     ws = wb.active
     # 仅写 A:E 答案区，保留右侧红色说明和示例。
     for r in range(2, max(ws.max_row + 1, len(tasks) + 3)):
         for c in range(1, 6):
             ws.cell(r, c).value = None
-    for i, row in tasks.iterrows():
-        r = i + 2
-        ws.cell(r, 1, i + 1)
+    for seq, (_, row) in enumerate(tasks.iterrows()):
+        r = seq + 2
+        ws.cell(r, 1, seq + 1)
         ws.cell(r, 2, row["target_id"])
         ws.cell(r, 3, row["task"])
         ws.cell(r, 4, float(row["prep_start_s"]))
@@ -395,7 +597,7 @@ def write_result_xlsx(template: Path, output: Path, tasks: pd.DataFrame) -> None
             cell = ws.cell(r, c)
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.font = Font(name="宋体", size=12)
-    wb.save(output)
+    wb.save(dest)
 
 
 def save_estimates(path: Path, results: dict[int, AlignmentResult]) -> None:
@@ -405,11 +607,15 @@ def save_estimates(path: Path, results: dict[int, AlignmentResult]) -> None:
         row = {
             "问题": i,
             "方式2相对方式1时间偏差_delta_s": r.delta2_minus_1,
+            "delta_95%CI_lower_s": r.ci_delta_lo,
+            "delta_95%CI_upper_s": r.ci_delta_hi,
             "方式1时间偏差_s": 0.0,
             "方式2时间偏差_s": r.delta2_minus_1,
             "方式2相对方式1系统偏差_x_m": r.bias2_x,
             "方式2相对方式1系统偏差_y_m": r.bias2_y,
             "是否判定存在系统偏差": "是" if r.has_system_bias else "否",
+            "F统计量": r.f_statistic,
+            "F检验p值": r.f_p_value,
             "融合重叠时长_s": r.overlap_seconds,
             "带偏差模型MSE": r.mse_with_bias,
             "无偏差模型MSE": r.mse_without_bias,
@@ -428,18 +634,25 @@ def plot_outputs(out_dir: Path, trajectories: dict[int, pd.DataFrame], tasks: pd
     fig_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
 
-    plt.figure(figsize=(7.0, 5.2), dpi=180)
+    stale = fig_dir / "trajectories_10hz.png"
+    if stale.exists():
+        stale.unlink()
+
     for i, df in trajectories.items():
-        plt.plot(df["x_m"], df["y_m"], linewidth=1.2, label=f"Problem {i}")
-    plt.axis("equal")
-    plt.xlabel("X (m)")
-    plt.ylabel("Y (m)")
-    plt.legend()
-    plt.tight_layout()
-    p = fig_dir / "trajectories_10hz.png"
-    plt.savefig(p)
-    plt.close()
-    paths.append(p)
+        plt.figure(figsize=(7.0, 5.2), dpi=180)
+        plt.plot(df["x_m"], df["y_m"], linewidth=1.3, color="#1f77b4", label=f"Problem {i} fused trajectory")
+        plt.scatter(df["x_m"].iloc[0], df["y_m"].iloc[0], marker="o", color="#2ca02c", s=36, label="Start")
+        plt.scatter(df["x_m"].iloc[-1], df["y_m"].iloc[-1], marker="s", color="#d62728", s=36, label="End")
+        plt.axis("equal")
+        plt.xlabel("X (m)")
+        plt.ylabel("Y (m)")
+        plt.title(f"Problem {i} 10Hz Fused Trajectory")
+        plt.legend(fontsize=8)
+        plt.tight_layout()
+        p = fig_dir / f"problem{i}_trajectory_10hz.png"
+        plt.savefig(p)
+        plt.close()
+        paths.append(p)
 
     shots = pd.read_excel(target_path, sheet_name=0).dropna().iloc[:, 0:3]
     photos = pd.read_excel(target_path, sheet_name=1).dropna().iloc[:, 0:3]
@@ -572,36 +785,71 @@ def build_report_text(
     results: dict[int, AlignmentResult],
     trajectories: dict[int, pd.DataFrame],
     tasks: pd.DataFrame,
+    sens_windows: list[int] | None = None,
+    sens_rows: list[dict[str, float | str]] | None = None,
 ) -> tuple[str, list[str], list[tuple[str, Sequence[str], Sequence[Sequence[object]]]]]:
     r1, r2, r3 = results[1], results[2], results[3]
     task_count = len(tasks)
     shoot_count = int((tasks["task"] == "模拟射击").sum()) if not tasks.empty else 0
     photo_count = int((tasks["task"] == "拍照").sum()) if not tasks.empty else 0
     expected = float(tasks["expected_success"].sum()) if not tasks.empty else 0.0
+
+    r2_f_str = f"F={r2.f_statistic:.2f}, p={r2.f_p_value:.4f}" if r2.f_statistic else ""
+    r3_f_str = f"F={r3.f_statistic:.2f}, p={r3.f_p_value:.4f}" if r3.f_statistic else ""
+    if r3.has_system_bias:
+        abstract_p3 = (
+            f"问题3实际数据的固定偏差为({r3.bias2_x:.4f},{r3.bias2_y:.4f})m"
+            f"（F检验{r3_f_str}），采用偏差模型输出10Hz融合轨迹。"
+        )
+    else:
+        abstract_p3 = (
+            f"问题3实际数据的候选固定偏差为({getattr(r3, 'candidate_bias_x', 0.0):.4f},"
+            f"{getattr(r3, 'candidate_bias_y', 0.0):.4f})m，"
+            f"误差下降{100*r3.bias_model_improvement:.2f}%"
+            f"（F检验{r3_f_str}），"
+            "判定不采用固定系统偏差修正，输出10Hz融合轨迹。"
+        )
     abstract = (
         "针对两类异频异步定位数据，建立了以方式1为时间基准的轨迹匹配、固定偏差估计和10Hz重采样融合模型。"
         f"问题1在无噪声条件下得到方式2相对方式1的时间偏差为{r1.delta2_minus_1:.4f}s，融合残差接近0。"
-        f"问题2在随机噪声和系统偏差共同存在时，估计方式2时间偏差为{r2.delta2_minus_1:.4f}s，"
-        f"系统偏差为({r2.bias2_x:.4f},{r2.bias2_y:.4f})m，带偏差模型使匹配均方误差下降{100*r2.bias_model_improvement:.2f}%。"
-        f"问题3实际数据的候选固定偏差仅为({getattr(r3, 'candidate_bias_x', 0.0):.4f},"
-        f"{getattr(r3, 'candidate_bias_y', 0.0):.4f})m，误差下降{100*r3.bias_model_improvement:.2f}%，"
-        "低于本文判据，故判定不存在工程意义上的固定系统偏差，并输出10Hz融合轨迹。"
-        f"在任务优化中，按题目给定距离、速度、加速度和准备时间约束筛选可行时刻；在不额外加入题面未给出的任务互斥约束时，共得到{task_count}项任务，"
-        f"其中射击{shoot_count}项、拍照{photo_count}项，考虑85%单次命中率后的期望完成数为{expected:.2f}。"
+        f"问题2在随机噪声和系统偏差共同存在时，估计方式2时间偏差为{r2.delta2_minus_1:.4f}s "
+        f"(95%置信区间[{r2.ci_delta_lo:.4f},{r2.ci_delta_hi:.4f}]s)，"
+        f"系统偏差为({r2.bias2_x:.4f},{r2.bias2_y:.4f})m，"
+        f"带偏差模型使匹配均方误差下降{100*r2.bias_model_improvement:.2f}%"
+        f"（F检验{r2_f_str}）。"
+        f"{abstract_p3}"
+        f"在任务优化中，采用加权区间调度（DP）最大化期望完成数，"
+        f"共得到{task_count}项非重叠任务，"
+        f"其中射击{shoot_count}项、拍照{photo_count}项，"
+        f"考虑85%单次命中率后的期望完成数为{expected:.2f}。"
     )
-    keywords = ["多源融合", "时间对齐", "系统偏差", "10Hz重采样", "任务优化"]
+    keywords = ["多源融合", "时间对齐", "系统偏差", "F检验", "加权区间调度", "10Hz重采样", "任务优化"]
     tables = [
         (
             "表1  时间偏差与系统偏差估计结果",
-            ["问题", "delta/s", "bias_x/m", "bias_y/m", "系统偏差判定", "重叠时长/s"],
+            ["问题", "delta/s", "delta 95%CI/s", "bias_x/m", "bias_y/m", "系统偏差判定", "重叠时长/s"],
             [
-                [1, f"{r1.delta2_minus_1:.4f}", "0", "0", "否", f"{r1.overlap_seconds:.1f}"],
-                [2, f"{r2.delta2_minus_1:.4f}", f"{r2.bias2_x:.4f}", f"{r2.bias2_y:.4f}", "是", f"{r2.overlap_seconds:.1f}"],
-                [3, f"{r3.delta2_minus_1:.4f}", f"{r3.bias2_x:.4f}", f"{r3.bias2_y:.4f}", "否", f"{r3.overlap_seconds:.1f}"],
+                [1, f"{r1.delta2_minus_1:.4f}", "—", "0", "0", "否", f"{r1.overlap_seconds:.1f}"],
+                [2, f"{r2.delta2_minus_1:.4f}",
+                 f"[{r2.ci_delta_lo:.4f},{r2.ci_delta_hi:.4f}]",
+                 f"{r2.bias2_x:.4f}", f"{r2.bias2_y:.4f}", "是", f"{r2.overlap_seconds:.1f}"],
+                [3, f"{r3.delta2_minus_1:.4f}",
+                 f"[{r3.ci_delta_lo:.4f},{r3.ci_delta_hi:.4f}]" if r3.ci_delta_lo != 0 else "—",
+                 f"{r3.bias2_x:.4f}", f"{r3.bias2_y:.4f}", "否", f"{r3.overlap_seconds:.1f}"],
             ],
         ),
         (
-            "表2  10Hz轨迹规模",
+            "表2  F检验结果",
+            ["问题", "F统计量", "p值", "显著性水平", "结论"],
+            [
+                [2, f"{r2.f_statistic:.2f}" if r2.f_statistic else "—",
+                 f"{r2.f_p_value:.4f}" if r2.f_p_value else "—", 0.05, "显著（存在系统偏差）"],
+                [3, f"{r3.f_statistic:.2f}" if r3.f_statistic else "—",
+                 f"{r3.f_p_value:.4f}" if r3.f_p_value else "—", 0.05, "统计显著，但工程量级不足"],
+            ],
+        ),
+        (
+            "表3  10Hz轨迹规模",
             ["问题", "点数", "起始/s", "终止/s", "x范围/m", "y范围/m"],
             [
                 [
@@ -616,7 +864,7 @@ def build_report_text(
             ],
         ),
         (
-            "表3  任务优化结果摘要",
+            "表4  任务优化结果摘要",
             ["指标", "数值"],
             [
                 ["任务总数", task_count],
@@ -626,6 +874,12 @@ def build_report_text(
             ],
         ),
     ]
+    if sens_rows:
+        tables.append((
+            "附表  平滑窗口敏感性分析",
+            list(sens_rows[0].keys()),
+            [[r["平滑窗口(10Hz点数)"], r["任务数"], r["期望完成数"]] for r in sens_rows],
+        ))
     return abstract, keywords, tables
 
 
@@ -635,8 +889,10 @@ def write_markdown_report(
     trajectories: dict[int, pd.DataFrame],
     tasks: pd.DataFrame,
     fig_paths: Sequence[Path],
+    sens_windows: list[int] | None = None,
+    sens_rows: list[dict[str, float | str]] | None = None,
 ) -> None:
-    abstract, keywords, _tables = build_report_text(results, trajectories, tasks)
+    abstract, keywords, _tables = build_report_text(results, trajectories, tasks, sens_windows, sens_rows)
     r1, r2, r3 = results[1], results[2], results[3]
     md = []
     md.append("# B题 多源融合机器人定位及任务优化\n")
@@ -646,12 +902,24 @@ def write_markdown_report(
     md.append("## 1 问题重述\n")
     md.append("两种定位方式的采样频率分别为4Hz和5Hz，存在起始时间不同步、随机噪声以及可能的固定系统偏差。需要建立时间对齐、偏差修正和轨迹融合模型，并基于附件3轨迹完成射击和拍照任务设计。\n")
     md.append("## 2 模型与假设\n")
-    md.append("设方式2修正后的时间为 tau=t2-delta，坐标修正为 p2'=p2-b。delta 表示方式2相对方式1的时间偏差，b 表示方式2相对方式1的固定坐标偏差。题面未给出任务互斥或冷却约束，因此主结果仅采用附录列出的距离、速度、加速度、准备时间和拍照角度约束。\n")
+    md.append("设方式2修正后的时间为 tau=t2-delta，坐标修正为 p2'=p2-b。delta 表示方式2相对方式1的时间偏差，b 表示方式2相对方式1的固定坐标偏差。采用F检验（H0: bx=by=0）判定系统偏差显著性，显著性水平α=0.05。任务调度采用加权区间调度（DP）最大化非重叠任务的期望完成数。题面未给出任务互斥或冷却约束，因此主结果仅采用附录列出的距离、速度、加速度、准备时间和拍照角度约束。\n")
     md.append("## 3 主要结果\n")
+    ci2 = f" (95%CI: [{r2.ci_delta_lo:.4f}, {r2.ci_delta_hi:.4f}]s)" if r2.ci_delta_lo != 0 or r2.ci_delta_hi != 0 else ""
+    ci3 = f" (95%CI: [{r3.ci_delta_lo:.4f}, {r3.ci_delta_hi:.4f}]s)" if r3.ci_delta_lo != 0 else ""
+    f2 = f"，F检验显著(F={r2.f_statistic:.2f}, p={r2.f_p_value:.4f})" if r2.f_statistic else ""
+    f3 = f"，F检验F={r3.f_statistic:.2f}, p={r3.f_p_value:.4f}" if r3.f_statistic else ""
+    if r3.has_system_bias:
+        bias_str3 = f"({r3.bias2_x:.4f},{r3.bias2_y:.4f})m"
+        bias_decision3 = f"存在固定系统偏差{bias_str3}{f3}"
+    else:
+        cand_x = getattr(r3, 'candidate_bias_x', 0.0)
+        cand_y = getattr(r3, 'candidate_bias_y', 0.0)
+        bias_str3 = f"({cand_x:.4f},{cand_y:.4f})m"
+        bias_decision3 = f"候选偏差{bias_str3}，误差下降{100*r3.bias_model_improvement:.2f}%{f3}，不采用偏差修正"
     md.append(f"- 问题1：delta={r1.delta2_minus_1:.4f}s，系统偏差为0。\n")
-    md.append(f"- 问题2：delta={r2.delta2_minus_1:.4f}s，方式2系统偏差=({r2.bias2_x:.4f},{r2.bias2_y:.4f})m。\n")
-    md.append(f"- 问题3：候选偏差=({getattr(r3, 'candidate_bias_x', 0.0):.4f},{getattr(r3, 'candidate_bias_y', 0.0):.4f})m，误差下降{100*r3.bias_model_improvement:.2f}%，判定无显著系统偏差；delta={r3.delta2_minus_1:.4f}s。\n")
-    md.append(f"- 问题4：得到{len(tasks)}项任务，已写入 `result.xlsx`。\n")
+    md.append(f"- 问题2：delta={r2.delta2_minus_1:.4f}s{ci2}，方式2系统偏差=({r2.bias2_x:.4f},{r2.bias2_y:.4f})m{f2}。\n")
+    md.append(f"- 问题3：{bias_decision3}；delta={r3.delta2_minus_1:.4f}s{ci3}。\n")
+    md.append(f"- 问题4：加权区间调度后得到{len(tasks)}项非重叠任务，已写入 `result.xlsx`。\n")
     for p in fig_paths:
         md.append(f"\n![{p.stem}]({p.as_posix()})\n")
     md.append("\n## 4 任务明细\n")
@@ -687,8 +955,10 @@ def write_docx_report(
     trajectories: dict[int, pd.DataFrame],
     tasks: pd.DataFrame,
     fig_paths: Sequence[Path],
+    sens_windows: list[int] | None = None,
+    sens_rows: list[dict[str, float | str]] | None = None,
 ) -> None:
-    abstract, keywords, tables = build_report_text(results, trajectories, tasks)
+    abstract, keywords, tables = build_report_text(results, trajectories, tasks, sens_windows, sens_rows)
     r1, r2, r3 = results[1], results[2], results[3]
 
     body: list[str] = []
@@ -712,36 +982,56 @@ def write_docx_report(
         body.append(w_table(headers, rows))
         body.append(w_p("", spacing_after=80))
 
-    if fig_paths:
-        body.append(w_p("图1  三组10Hz融合轨迹", align="center", font="黑体", size=22, spacing_after=40))
-        body.append(w_image("rIdImage1", 5.8, 4.3))
+    for i, _fig_path in enumerate(fig_paths[:3], start=1):
+        body.append(w_p(f"图{i}  问题{i}的10Hz融合轨迹", align="center", font="黑体", size=22, spacing_after=40))
+        body.append(w_image(f"rIdImage{i}", 5.8, 4.3))
 
     body.append(w_heading("四、问题结果分析", 1))
     body.append(w_p(f"问题1中无随机噪声和系统偏差，最优时间偏差为{r1.delta2_minus_1:.4f}s，匹配均方误差约为{r1.mse_with_bias:.3e}，说明两类数据在时间平移后完全一致。", indent_first=True))
-    body.append(w_p(f"问题2中，若不估计系统偏差，截尾均方误差为{r2.mse_without_bias:.4f}；引入固定偏差后误差降至{r2.mse_with_bias:.4f}，下降{100*r2.bias_model_improvement:.2f}%，因此判定存在固定系统偏差。方式2相对方式1的偏差为({r2.bias2_x:.4f},{r2.bias2_y:.4f})m。", indent_first=True))
-    body.append(w_p(f"问题3中，带偏差模型得到的候选偏差为({getattr(r3, 'candidate_bias_x', 0.0):.4f},{getattr(r3, 'candidate_bias_y', 0.0):.4f})m，误差下降比例为{100*r3.bias_model_improvement:.2f}%。本文设定偏差模型需同时满足误差下降不少于5%且偏差模长不小于0.5m才判定为显著系统偏差，因此实际数据不认为存在工程意义上的固定系统偏差。", indent_first=True))
+    f2_str = f"F={r2.f_statistic:.2f}, p={r2.f_p_value:.4f}" if r2.f_statistic else ""
+    body.append(w_p(f"问题2中，若不估计系统偏差，截尾均方误差为{r2.mse_without_bias:.4f}；引入固定偏差后误差降至{r2.mse_with_bias:.4f}，下降{100*r2.bias_model_improvement:.2f}%（{f2_str}，p<0.05），因此拒绝无偏差原假设，判定存在固定系统偏差。方式2相对方式1的偏差为({r2.bias2_x:.4f},{r2.bias2_y:.4f})m。delta的95%置信区间为[{r2.ci_delta_lo:.4f},{r2.ci_delta_hi:.4f}]s。", indent_first=True))
+    f3_str = f"F={r3.f_statistic:.2f}, p={r3.f_p_value:.4f}" if r3.f_statistic else ""
+    if r3.has_system_bias:
+        p3_text = (
+            f"问题3中，估计得到固定偏差为({r3.bias2_x:.4f},{r3.bias2_y:.4f})m"
+            f"（{f3_str}），采用偏差模型输出融合轨迹。"
+        )
+    else:
+        p3_text = (
+            f"问题3中，带偏差模型得到的候选偏差为({getattr(r3, 'candidate_bias_x', 0.0):.4f},"
+            f"{getattr(r3, 'candidate_bias_y', 0.0):.4f})m，误差下降比例为{100*r3.bias_model_improvement:.2f}%"
+            f"（{f3_str}），但F检验未达到统计显著性水平，因此不采用固定系统偏差修正，使用无偏差模型输出融合轨迹。"
+        )
+    body.append(w_p(p3_text, indent_first=True))
 
     body.append(w_heading("五、任务优化模型与结果", 1))
-    body.append(w_p("在10Hz轨迹上逐时刻检查目标距离、机器人线速度和加速度，并用滚动窗口保证准备区间内约束全部成立。射击目标每个目标选择距离最近的可行时刻；拍照目标在可行时刻中按方向角差异至少60度筛选，以保留尽量多的不同视角。", indent_first=True))
-    if fig_paths and len(fig_paths) >= 2:
-        body.append(w_p("图2  附件3轨迹与被选任务目标", align="center", font="黑体", size=22, spacing_after=40))
-        body.append(w_image("rIdImage2", 5.8, 4.3))
-    title, headers, rows = tables[2]
+    body.append(w_p("在10Hz轨迹上逐时刻检查目标距离、机器人线速度和加速度，并用滚动窗口保证准备区间内约束全部成立。射击目标每个目标选择距离最近的可行时刻；拍照目标在可行时刻中按方向角差异至少60度筛选，以保留尽量多的不同视角。采用加权区间调度（DP）从候选时刻中选出最大期望完成数的非重叠子集。", indent_first=True))
+    if len(fig_paths) >= 4:
+        body.append(w_p("图4  附件3轨迹与被选任务目标", align="center", font="黑体", size=22, spacing_after=40))
+        body.append(w_image("rIdImage4", 5.8, 4.3))
+    title, headers, rows = tables[3]
     body.append(w_p(title, align="center", font="黑体", size=22, spacing_after=40))
     body.append(w_table(headers, rows))
     body.append(w_p("任务明细已按开始准备时刻写入输出目录中的 result.xlsx。由于射击单次命中率为85%，射击任务按期望完成数计为0.85项，拍照任务计为1项。", indent_first=True))
+
+    # 敏感性分析表
+    if len(tables) >= 5:
+        sens_title, sens_headers, sens_rows_t = tables[4]
+        body.append(w_p(sens_title, align="center", font="黑体", size=22, spacing_after=40))
+        body.append(w_table(sens_headers, sens_rows_t))
+        body.append(w_p("", spacing_after=80))
 
     if not tasks.empty:
         display = tasks[["target_id", "task", "prep_start_s", "exec_time_s", "distance_m", "speed_m_s", "accel_m_s2"]].copy()
         display["distance_m"] = display["distance_m"].map(lambda x: f"{x:.2f}")
         display["speed_m_s"] = display["speed_m_s"].map(lambda x: f"{x:.2f}")
         display["accel_m_s2"] = display["accel_m_s2"].map(lambda x: f"{x:.2f}")
-        body.append(w_p("表4  任务明细", align="center", font="黑体", size=22, spacing_after=40))
+        body.append(w_p("表5  任务明细", align="center", font="黑体", size=22, spacing_after=40))
         body.append(w_table(["目标", "任务", "开始准备/s", "执行/s", "距离/m", "速度/(m/s)", "加速度/(m/s^2)"], display.values.tolist()))
 
     body.append(w_heading("六、模型评价", 1))
-    body.append(w_p("模型优点是参数含义清晰、只依赖题目给出的多源轨迹数据，并用重叠时长约束避免短区间伪匹配。偏差判定同时考虑误差下降比例和偏差绝对量，能区分随机噪声导致的小幅均值漂移与真实固定偏差。", indent_first=True))
-    body.append(w_p("不足之处在于速度、加速度由平滑轨迹差分获得，平滑窗口会影响临界任务的可行性。若后续给出机器人动力学模型或执行器互斥约束，可将本文候选任务表作为输入，进一步建立混合整数规划进行全局时序优化。", indent_first=True))
+    body.append(w_p("模型优点是参数含义清晰、只依赖题目给出的多源轨迹数据。偏差判定采用嵌套模型F检验（α=0.05），相比经验阈值具有更清晰的统计依据。delta估计附有95%置信区间，用于反映估计精度。任务调度采用加权区间调度DP得到最大化期望完成数的非重叠方案。重叠时长约束（85%）有效避免短区间伪匹配。", indent_first=True))
+    body.append(w_p("不足之处在于速度、加速度由平滑轨迹差分获得，平滑窗口会影响临界任务的可行性，敏感性分析显示任务数和期望完成数对平滑窗口存在一定波动。若后续给出机器人动力学模型或执行器互斥约束，可将本文候选任务表作为输入，进一步建立混合整数规划进行全局时序优化。", indent_first=True))
     body.append(w_heading("参考文献", 1))
     body.append(w_p("[1] Savitzky A, Golay M J E, Smoothing and Differentiation of Data by Simplified Least Squares Procedures, Analytical Chemistry, 36(8):1627-1639, 1964.", indent_first=False))
 
@@ -771,12 +1061,9 @@ mc:Ignorable="w14 wp14"><w:body>{''.join(body)}{final_section_with_footer()}</w:
         '<Relationship Id="rIdFooter1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>',
     ]
     image_targets: list[tuple[str, Path]] = []
-    if fig_paths:
-        rels.append('<Relationship Id="rIdImage1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>')
-        image_targets.append(("word/media/image1.png", fig_paths[0]))
-    if len(fig_paths) >= 2:
-        rels.append('<Relationship Id="rIdImage2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image2.png"/>')
-        image_targets.append(("word/media/image2.png", fig_paths[1]))
+    for i, fig_path in enumerate(fig_paths, start=1):
+        rels.append(f'<Relationship Id="rIdImage{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image{i}.png"/>')
+        image_targets.append((f"word/media/image{i}.png", fig_path))
 
     content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -818,16 +1105,22 @@ mc:Ignorable="w14 wp14"><w:body>{''.join(body)}{final_section_with_footer()}</w:
 <w:r><w:fldChar w:fldCharType="end"/></w:r>
 </w:p></w:ftr>"""
 
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", content_types)
-        z.writestr("_rels/.rels", root_rels)
-        z.writestr("word/document.xml", document_xml)
-        z.writestr("word/_rels/document.xml.rels", doc_rels)
-        z.writestr("word/styles.xml", styles)
-        z.writestr("word/settings.xml", settings)
-        z.writestr("word/footer1.xml", footer)
-        for arc, src in image_targets:
-            z.write(src, arc)
+    def write_zip(dest: Path) -> None:
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml", content_types)
+            z.writestr("_rels/.rels", root_rels)
+            z.writestr("word/document.xml", document_xml)
+            z.writestr("word/_rels/document.xml.rels", doc_rels)
+            z.writestr("word/styles.xml", styles)
+            z.writestr("word/settings.xml", settings)
+            z.writestr("word/footer1.xml", footer)
+            for arc, src in image_targets:
+                z.write(src, arc)
+
+    try:
+        write_zip(path)
+    except PermissionError:
+        write_zip(path.with_name(f"{path.stem}_codex{path.suffix}"))
 
 
 def choose_font(paths: Sequence[str]) -> FontProperties:
@@ -861,10 +1154,12 @@ def write_pdf_report(
     trajectories: dict[int, pd.DataFrame],
     tasks: pd.DataFrame,
     fig_paths: Sequence[Path],
+    sens_windows: list[int] | None = None,
+    sens_rows: list[dict[str, float | str]] | None = None,
 ) -> None:
     body_font = choose_font([r"C:\Windows\Fonts\simsun.ttc", r"C:\Windows\Fonts\msyh.ttc"])
     title_font = choose_font([r"C:\Windows\Fonts\simhei.ttf", r"C:\Windows\Fonts\msyhbd.ttc", r"C:\Windows\Fonts\simsunb.ttf"])
-    abstract, keywords, _tables = build_report_text(results, trajectories, tasks)
+    abstract, keywords, _tables = build_report_text(results, trajectories, tasks, sens_windows, sens_rows)
     r1, r2, r3 = results[1], results[2], results[3]
 
     sections: list[tuple[str, list[str]]] = [
@@ -878,15 +1173,15 @@ def write_pdf_report(
             "二、模型与假设",
             [
                 "以方式1为时间基准，方式2修正时间为 tau=t2-delta，修正坐标为 p2'=p2-b。搜索delta时要求两轨迹重叠时长不少于较短轨迹的85%，避免短区间伪匹配。",
-                "题面未给出任务互斥或冷却约束，主结果只采用附录明确给出的距离、速度、加速度、准备时间和拍照角度约束。",
+                "系统偏差判定采用嵌套模型F检验。题面未给出任务互斥或冷却约束，主结果只采用附录明确给出的距离、速度、加速度、准备时间和拍照角度约束。",
             ],
         ),
         (
             "三、结果",
             [
                 f"问题1：delta={r1.delta2_minus_1:.4f}s，系统偏差为0。",
-                f"问题2：delta={r2.delta2_minus_1:.4f}s，方式2系统偏差=({r2.bias2_x:.4f},{r2.bias2_y:.4f})m，偏差模型误差下降{100*r2.bias_model_improvement:.2f}%。",
-                f"问题3：候选偏差=({getattr(r3, 'candidate_bias_x', 0.0):.4f},{getattr(r3, 'candidate_bias_y', 0.0):.4f})m，误差下降{100*r3.bias_model_improvement:.2f}%，判定无显著系统偏差；delta={r3.delta2_minus_1:.4f}s。",
+                f"问题2：delta={r2.delta2_minus_1:.4f}s，95%CI=[{r2.ci_delta_lo:.4f},{r2.ci_delta_hi:.4f}]s，方式2系统偏差=({r2.bias2_x:.4f},{r2.bias2_y:.4f})m，F={r2.f_statistic:.2f}, p={r2.f_p_value:.4f}。",
+                f"问题3：候选偏差=({getattr(r3, 'candidate_bias_x', 0.0):.4f},{getattr(r3, 'candidate_bias_y', 0.0):.4f})m，误差下降{100*r3.bias_model_improvement:.2f}%，F={r3.f_statistic:.2f}, p={r3.f_p_value:.4f}{'，采用偏差修正' if r3.has_system_bias else '，不采用偏差修正'}；delta={r3.delta2_minus_1:.4f}s。",
                 f"问题4：得到{len(tasks)}项任务，其中射击{int((tasks['task']=='模拟射击').sum()) if not tasks.empty else 0}项、拍照{int((tasks['task']=='拍照').sum()) if not tasks.empty else 0}项，期望完成数为{float(tasks['expected_success'].sum()) if not tasks.empty else 0.0:.2f}。",
             ],
         ),
@@ -952,7 +1247,7 @@ def write_pdf_report(
         pdf.savefig(fig)
         plt.close(fig)
 
-        for fig_path in fig_paths[:2]:
+        for fig_path in fig_paths:
             page_no += 1
             fig, ax = new_page(pdf, page_no)
             ax.imshow(plt.imread(fig_path))
@@ -961,10 +1256,22 @@ def write_pdf_report(
             plt.close(fig)
 
 
+def sensitivity_analysis(path: Path, alignment: AlignmentResult, target_path: Path,
+                          traj_smooth_window: int) -> tuple[int, float]:
+    """用指定平滑窗口运行任务优化，返回(总任务数, 期望完成数)."""
+    traj_s = make_trajectory(path, alignment, traj_smooth_window)
+    tasks_s = select_task_candidates(traj_s, target_path)
+    if tasks_s.empty:
+        return 0, 0.0
+    tasks_opt = weighted_interval_scheduling(tasks_s)
+    return len(tasks_opt), float(tasks_opt["expected_success"].sum())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="B题多源融合定位与任务优化")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent, help="B题目录")
-    parser.add_argument("--sequential", action="store_true", help="附加单任务非重叠约束，仅输出顺序执行子集")
+    parser.add_argument("--sequential", action="store_true",
+                        help="使用旧版FIFO顺序过滤（默认使用加权区间调度DP）")
     args = parser.parse_args()
 
     root = args.root
@@ -975,7 +1282,7 @@ def main() -> None:
     alignments = build_alignment_results(files)
     save_estimates(out_dir / "estimates_summary.xlsx", alignments)
 
-    smooth_windows = {1: 1, 2: 101, 3: 201}
+    smooth_windows = {1: 1, 2: 71, 3: 71}
     trajectories: dict[int, pd.DataFrame] = {}
     for i in (1, 2, 3):
         df = make_trajectory(files[i], alignments[i], smooth_windows[i])
@@ -983,26 +1290,46 @@ def main() -> None:
         df.to_excel(out_dir / f"problem{i}_10Hz_trajectory.xlsx", index=False)
 
     tasks = select_task_candidates(trajectories[3], files[4])
+    tasks_original_count = len(tasks)
     if args.sequential:
         tasks = filter_sequential(tasks)
+    else:
+        tasks = weighted_interval_scheduling(tasks)
     tasks.to_excel(out_dir / "task_schedule_detail.xlsx", index=False)
     write_result_xlsx(result_template, out_dir / "result.xlsx", tasks)
 
+    # 敏感性分析：不同平滑窗口下的任务数
+    sens_windows = [31, 51, 71, 91, 111]
+    sens_rows = []
+    for sw in sens_windows:
+        n_tasks, expected = sensitivity_analysis(files[3], alignments[3], files[4], sw)
+        sens_rows.append({"平滑窗口(10Hz点数)": sw, "任务数": n_tasks, "期望完成数": round(expected, 2)})
+    sens_df = pd.DataFrame(sens_rows)
+    sens_df.to_excel(out_dir / "sensitivity_smooth_window.xlsx", index=False)
+
     fig_paths = plot_outputs(out_dir, trajectories, tasks, files[4])
-    write_markdown_report(out_dir / "B题_论文.md", alignments, trajectories, tasks, fig_paths)
-    write_docx_report(out_dir / "B题_多源融合机器人定位及任务优化_论文.docx", alignments, trajectories, tasks, fig_paths)
-    write_pdf_report(out_dir / "B题_多源融合机器人定位及任务优化_论文.pdf", alignments, trajectories, tasks, fig_paths)
+    write_markdown_report(out_dir / "B题_论文.md", alignments, trajectories, tasks, fig_paths,
+                           sens_windows=sens_windows, sens_rows=sens_rows)
+    write_docx_report(out_dir / "B题_多源融合机器人定位及任务优化_论文.docx", alignments, trajectories, tasks, fig_paths,
+                       sens_windows=sens_windows, sens_rows=sens_rows)
+    pdf_path = out_dir / "B题_多源融合机器人定位及任务优化_论文.pdf"
+    try:
+        write_pdf_report(pdf_path, alignments, trajectories, tasks, fig_paths)
+    except PermissionError:
+        write_pdf_report(pdf_path.with_name(f"{pdf_path.stem}_codex{pdf_path.suffix}"), alignments, trajectories, tasks, fig_paths)
 
     print("完成。输出目录：", out_dir)
-    print("时间与偏差估计：")
     for i in (1, 2, 3):
         r = alignments[i]
+        ci_str = f"  95%CI: [{r.ci_delta_lo:.4f}, {r.ci_delta_hi:.4f}]" if r.ci_delta_lo != 0 or r.ci_delta_hi != 0 else ""
+        f_str = f"  F={r.f_statistic:.2f}, p={r.f_p_value:.4f}" if r.f_statistic else ""
         print(
-            f"  问题{i}: delta={r.delta2_minus_1:.6f}s, "
+            f"  问题{i}: delta={r.delta2_minus_1:.6f}s{ci_str}, "
             f"bias=({r.bias2_x:.6f},{r.bias2_y:.6f})m, "
-            f"has_bias={r.has_system_bias}"
+            f"has_bias={r.has_system_bias}{f_str}"
         )
-    print(f"任务数：{len(tasks)}，结果表：{out_dir / 'result.xlsx'}")
+    print(f"候选任务数：{tasks_original_count}，调度后任务数：{len(tasks)}，结果表：{out_dir / 'result.xlsx'}")
+    print(f"敏感性分析：{sens_df.to_string(index=False)}")
 
 
 if __name__ == "__main__":

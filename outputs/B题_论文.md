@@ -37,6 +37,21 @@
 ![problem4_selected_tasks](F:/2026_B题/outputs/figures/problem4_selected_tasks.png)
 
 
+![problem2_diagnostics](F:/2026_B题/outputs/figures/problem2_diagnostics.png)
+
+
+![problem3_diagnostics](F:/2026_B题/outputs/figures/problem3_diagnostics.png)
+
+
+![sensitivity_analysis](F:/2026_B题/outputs/figures/sensitivity_analysis.png)
+
+
+![speed_acceleration_profile](F:/2026_B题/outputs/figures/speed_acceleration_profile.png)
+
+
+![window_impact_velocity](F:/2026_B题/outputs/figures/window_impact_velocity.png)
+
+
 ## 4 任务明细
 
 | target_id | task | prep_start_s | exec_time_s | distance_m | speed_m_s | accel_m_s2 | angle_deg | expected_success |

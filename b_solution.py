@@ -38,8 +38,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.font_manager import FontProperties
 from scipy.optimize import minimize_scalar
 from scipy.signal import savgol_filter
-from scipy.stats import f as f_dist
-
+from scipy.stats import f as f_dist, shapiro, probplot
 
 DT_OUT = 0.1
 
@@ -420,6 +419,98 @@ def circular_angle_diff_deg(a: float, b: float) -> float:
     return float(d)
 
 
+def compute_alignment_residuals(
+    t1: np.ndarray, p1: np.ndarray, t2: np.ndarray, p2: np.ndarray,
+    delta: float, bias: np.ndarray, dt: float = 0.1,
+) -> np.ndarray:
+    """Compute per-point alignment residuals (euclidean distance per point). """
+    t2_corr = t2 - delta
+    p2_corr = p2 - bias
+    lo = max(float(t1.min()), float(t2_corr.min()))
+    hi = min(float(t1.max()), float(t2_corr.max()))
+    grid = np.arange(lo, hi + 1e-9, dt)
+    q1 = interp_xy(grid, t1, p1)
+    q2 = interp_xy(grid, t2_corr, p2_corr)
+    diff = q2 - q1
+    return np.linalg.norm(diff, axis=1), diff
+
+
+def residual_diagnostics(
+    t1: np.ndarray, p1: np.ndarray, t2: np.ndarray, p2: np.ndarray,
+    delta: float, bias: np.ndarray, label: str = "",
+) -> dict:
+    """Full residual diagnostic suite for a given alignment. """
+    dists, diff = compute_alignment_residuals(t1, p1, t2, p2, delta, bias)
+    n = len(dists)
+    mean_res = float(np.mean(dists))
+    std_res = float(np.std(dists))
+    # Noise std estimate: MAD robust estimator
+    mad = float(np.median(np.abs(dists - np.median(dists)))) * 1.4826
+    # Normality test (Shapiro-Wilk, limited to 5000 points)
+    if n > 5000:
+        idx = np.linspace(0, n - 1, 5000, dtype=int)
+        shap_stat, shap_p = shapiro(dists[idx])
+    else:
+        shap_stat, shap_p = shapiro(dists)
+    # Auto-correlation at lag-1
+    autocorr = float(np.corrcoef(dists[:-1], dists[1:])[0, 1]) if n > 1 else 0.0
+    # Per-axis stats
+    x_residuals = diff[:, 0]
+    y_residuals = diff[:, 1]
+    noise_std_x = float(np.std(x_residuals))
+    noise_std_y = float(np.std(y_residuals))
+    return {
+        "label": label,
+        "n_points": n,
+        "mean_residual": mean_res,
+        "std_residual": std_res,
+        "mad_robust_std": mad,
+        "noise_std_est_x": noise_std_x,
+        "noise_std_est_y": noise_std_y,
+        "shapiro_stat": float(shap_stat),
+        "shapiro_p": float(shap_p),
+        "autocorr_lag1": autocorr,
+        "max_residual": float(np.max(dists)),
+        "p95_residual": float(np.percentile(dists, 95)),
+    }
+
+
+def estimate_window_impact(
+    t1: np.ndarray, p1: np.ndarray, t2: np.ndarray, p2: np.ndarray,
+    delta: float, bias: np.ndarray,
+    windows: list[int],
+) -> list[dict]:
+    """Evaluate how Savgol window size affects velocity/accel statistics. """
+    results = []
+    t2_corr = t2 - delta
+    p2_corr = p2 - bias
+    lo = max(float(t1.min()), float(t2_corr.min()))
+    hi = min(float(t1.max()), float(t2_corr.max()))
+    grid = np.arange(lo, hi + 1e-9, DT_OUT)
+    q1 = interp_xy(grid, t1, p1)
+    q2 = interp_xy(grid, t2_corr, p2_corr)
+    fused_raw = 0.5 * (q1 + q2)
+    for w in windows:
+        if w <= 1 or len(fused_raw) <= w:
+            continue
+        w_odd = w if w % 2 == 1 else w + 1
+        vel = savgol_filter(fused_raw, w_odd, 3, deriv=1, axis=0, mode="interp") / DT_OUT
+        acc = savgol_filter(fused_raw, w_odd, 3, deriv=2, axis=0, mode="interp") / DT_OUT**2
+        speed = np.linalg.norm(vel, axis=1)
+        acc_mag = np.linalg.norm(acc, axis=1)
+        results.append({
+            "window": w_odd,
+            "speed_max": float(np.max(speed)),
+            "speed_mean": float(np.mean(speed)),
+            "speed_std": float(np.std(speed)),
+            "acc_max": float(np.max(acc_mag)),
+            "acc_mean": float(np.mean(acc_mag)),
+            "pct_speed_gt_2": float(np.mean(speed > 2.0) * 100),
+            "pct_acc_gt_1_5": float(np.mean(acc_mag > 1.5) * 100),
+        })
+    return results
+
+
 def select_task_candidates(traj: pd.DataFrame, target_path: Path) -> pd.DataFrame:
     t = traj["time_s"].to_numpy(float)
     xy = traj[["x_m", "y_m"]].to_numpy(float)
@@ -675,6 +766,140 @@ def plot_outputs(out_dir: Path, trajectories: dict[int, pd.DataFrame], tasks: pd
     plt.savefig(p)
     plt.close()
     paths.append(p)
+    return paths
+
+
+def plot_diagnostics(
+    out_dir: Path,
+    files: dict[int, Path],
+    alignments: dict[int, AlignmentResult],
+    traj_3: pd.DataFrame,
+    sens_windows: list[int],
+    sens_rows_data: list[dict],
+    window_impact_data: list[dict] | None = None,
+) -> list[Path]:
+    """Generate diagnostic plots: QQ, residuals, sensitivity, speed comparison. """
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+
+    # QQ plots for Problem 2 and 3
+    for prob in (2, 3):
+        t1, p1, t2, p2 = read_pair(files[prob])
+        al = alignments[prob]
+        dists, _diff = compute_alignment_residuals(
+            t1, p1, t2, p2, al.delta2_minus_1, np.array([al.bias2_x, al.bias2_y])
+        )
+        n = len(dists)
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4.2), dpi=150)
+        # QQ plot
+        probplot(dists, dist="norm", plot=axes[0])
+        axes[0].set_title(f"Problem {prob} Residual QQ Plot (n={n})")
+        axes[0].set_xlabel("Theoretical Quantiles")
+        axes[0].set_ylabel("Sample Quantiles")
+        # Histogram
+        axes[1].hist(dists, bins=60, density=True, alpha=0.7, color="#1f77b4", edgecolor="white")
+        from scipy.stats import norm as norm_dist
+        x_range = np.linspace(dists.min(), dists.max(), 200)
+        axes[1].plot(x_range, norm_dist.pdf(x_range, np.mean(dists), np.std(dists)),
+                     "r-", linewidth=1.5, label="Normal fit")
+        axes[1].set_title(f"Problem {prob} Residual Distribution")
+        axes[1].set_xlabel("Residual (m)")
+        axes[1].set_ylabel("Density")
+        axes[1].legend(fontsize=8)
+        # Residuals vs order
+        axes[2].plot(dists, "o", markersize=1.2, alpha=0.4, color="#1f77b4")
+        axes[2].axhline(np.mean(dists), color="r", linestyle="--", linewidth=1, label=f"Mean={np.mean(dists):.4f}")
+        axes[2].axhline(np.mean(dists) + 3 * np.std(dists), color="orange", linestyle=":", linewidth=1, label="±3σ")
+        axes[2].axhline(np.mean(dists) - 3 * np.std(dists), color="orange", linestyle=":", linewidth=1)
+        axes[2].set_title(f"Problem {prob} Residuals vs Index")
+        axes[2].set_xlabel("Sample index")
+        axes[2].set_ylabel("Residual (m)")
+        axes[2].legend(fontsize=8)
+        plt.tight_layout()
+        p = fig_dir / f"problem{prob}_diagnostics.png"
+        plt.savefig(p, bbox_inches="tight")
+        plt.close()
+        paths.append(p)
+
+    # Sensitivity analysis chart
+    if sens_rows_data:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), dpi=150)
+        windows = [r["平滑窗口(10Hz点数)"] for r in sens_rows_data]
+        n_tasks = [r["任务数"] for r in sens_rows_data]
+        expected = [r["期望完成数"] for r in sens_rows_data]
+        axes[0].plot(windows, n_tasks, "o-", color="#1f77b4", linewidth=1.8, markersize=7)
+        axes[0].axhline(10, color="gray", linestyle="--", linewidth=0.8, alpha=0.7, label="Default (71)")
+        axes[0].set_xlabel("Smoothing window (10Hz samples)")
+        axes[0].set_ylabel("Number of tasks")
+        axes[0].set_title("Sensitivity: Window Size vs Task Count")
+        axes[0].legend(fontsize=8)
+        axes[0].grid(True, alpha=0.3)
+        axes[1].plot(windows, expected, "s-", color="#d62728", linewidth=1.8, markersize=7)
+        axes[1].axhline(9.55, color="gray", linestyle="--", linewidth=0.8, alpha=0.7, label="Default (71)")
+        axes[1].set_xlabel("Smoothing window (10Hz samples)")
+        axes[1].set_ylabel("Expected completed tasks")
+        axes[1].set_title("Sensitivity: Window Size vs Expected Completion")
+        axes[1].legend(fontsize=8)
+        axes[1].grid(True, alpha=0.3)
+        plt.tight_layout()
+        p = fig_dir / "sensitivity_analysis.png"
+        plt.savefig(p, bbox_inches="tight")
+        plt.close()
+        paths.append(p)
+
+    # Speed/acceleration profile for Problem 3 trajectory
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), dpi=150)
+    t = traj_3["time_s"].to_numpy()
+    axes[0].plot(t, traj_3["x_m"], label="X", color="#1f77b4", linewidth=1)
+    axes[0].plot(t, traj_3["y_m"], label="Y", color="#ff7f0e", linewidth=1)
+    axes[0].set_ylabel("Position (m)")
+    axes[0].set_title("Problem 3 Fused Trajectory: Position vs Time")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+    axes[1].plot(t, traj_3["speed_m_s"], color="#2ca02c", linewidth=1)
+    axes[1].axhline(2.0, color="r", linestyle="--", alpha=0.5, label="Speed limit (2 m/s)")
+    axes[1].axhline(1.5, color="orange", linestyle=":", alpha=0.5, label="Photo limit (1.5 m/s)")
+    axes[1].set_ylabel("Speed (m/s)")
+    axes[1].set_title("Speed Profile")
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+    axes[2].plot(t, traj_3["accel_m_s2"], color="#d62728", linewidth=1)
+    axes[2].axhline(1.5, color="r", linestyle="--", alpha=0.5, label="Accel limit (1.5 m/s²)")
+    axes[2].set_ylabel("Acceleration (m/s²)")
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_title("Acceleration Profile")
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.3)
+    plt.tight_layout()
+    p = fig_dir / "speed_acceleration_profile.png"
+    plt.savefig(p, bbox_inches="tight")
+    plt.close()
+    paths.append(p)
+
+    # Window impact on velocity estimation
+    if window_impact_data:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), dpi=150)
+        windows = [r["window"] for r in window_impact_data]
+        axes[0].plot(windows, [r["speed_max"] for r in window_impact_data], "o-", color="#1f77b4", linewidth=1.8, markersize=6, label="Max speed")
+        axes[0].plot(windows, [r["speed_mean"] for r in window_impact_data], "s-", color="#2ca02c", linewidth=1.8, markersize=6, label="Mean speed")
+        axes[0].axhline(2.0, color="r", linestyle="--", alpha=0.5, label="Limit (2 m/s)")
+        axes[0].set_xlabel("Smoothing window")
+        axes[0].set_ylabel("Speed (m/s)")
+        axes[0].set_title("Window Impact on Speed Estimates")
+        axes[0].legend(fontsize=8)
+        axes[0].grid(True, alpha=0.3)
+        axes[1].plot(windows, [r["pct_speed_gt_2"] for r in window_impact_data], "o-", color="#d62728", linewidth=1.8, markersize=6)
+        axes[1].set_xlabel("Smoothing window")
+        axes[1].set_ylabel("% samples > 2 m/s")
+        axes[1].set_title("% Speed Samples Exceeding Limit")
+        axes[1].grid(True, alpha=0.3)
+        plt.tight_layout()
+        p = fig_dir / "window_impact_velocity.png"
+        plt.savefig(p, bbox_inches="tight")
+        plt.close()
+        paths.append(p)
+
     return paths
 
 
@@ -1307,7 +1532,34 @@ def main() -> None:
     sens_df = pd.DataFrame(sens_rows)
     sens_df.to_excel(out_dir / "sensitivity_smooth_window.xlsx", index=False)
 
+    # ----- 诊断分析 -----
+    diagnostic_results: dict[int, dict] = {}
+    for prob in (2, 3):
+        t1, p1, t2, p2 = read_pair(files[prob])
+        al = alignments[prob]
+        diag = residual_diagnostics(t1, p1, t2, p2, al.delta2_minus_1,
+                                     np.array([al.bias2_x, al.bias2_y]),
+                                     label=f"Problem {prob}")
+        diagnostic_results[prob] = diag
+        print(f"  问题{prob}残差诊断: mean={diag['mean_residual']:.4f}, "
+              f"std={diag['std_residual']:.4f}, Shapiro p={diag['shapiro_p']:.4f}")
+
+    # 窗口速度估计影响分析
+    t1_3, p1_3, t2_3, p2_3 = read_pair(files[3])
+    window_impact = estimate_window_impact(
+        t1_3, p1_3, t2_3, p2_3,
+        alignments[3].delta2_minus_1,
+        np.array([alignments[3].bias2_x, alignments[3].bias2_y]),
+        windows=[1, 11, 21, 31, 41, 51, 61, 71, 81, 91, 101, 111],
+    )
+
     fig_paths = plot_outputs(out_dir, trajectories, tasks, files[4])
+    diag_paths = plot_diagnostics(
+        out_dir, files, alignments, trajectories[3],
+        sens_windows=sens_windows, sens_rows_data=sens_rows,
+        window_impact_data=window_impact,
+    )
+    fig_paths = list(fig_paths) + list(diag_paths)
     write_markdown_report(out_dir / "B题_论文.md", alignments, trajectories, tasks, fig_paths,
                            sens_windows=sens_windows, sens_rows=sens_rows)
     write_docx_report(out_dir / "B题_多源融合机器人定位及任务优化_论文.docx", alignments, trajectories, tasks, fig_paths,
